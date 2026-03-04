@@ -34,6 +34,8 @@ conda activate FashionDPO
 
 We follow the previous work [DiFashion](https://github.com/YiyanXu/DiFashion?tab=readme-ov-file) and use the datasets of iFashion and Polyvore-U, which include the required data of both fashion outfit and user-fashion item interactions. 
 
+To simplify the process of handling and merging the datasets, we provide the complete datasets for DiFashion and FashionDPO, which can be downloaded via the [Google Drive link]{https://drive.google.com/drive/folders/1SipoOyu0FKwxceItxAfC_O7BeWS5xwVd?usp=sharing}.
+
 ## Fashion Image Generation without Feedback
 
 During the sampling phase, this code generates 7 recommended items for each outfit as a candidate set. 
