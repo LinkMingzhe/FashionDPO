@@ -212,7 +212,8 @@ def parse_all_args():
     parser.add_argument(
         "--num_train_timesteps",
         type=int,
-        default=50
+        default=50,
+        help="Maximum saved transitions to train on per preference pair; capped by the cached trajectory length.",
     )
     parser.add_argument(
         "--category_guidance_scale",
@@ -405,23 +406,47 @@ def parse_all_args():
     return args
 
 
-def pred_noise(noise_pred=None):
-    category_guidance_scale = 7.5
-    hist_guidance_scale = 7.5
-    mutual_guidance_scale = 7.5
-
+def pred_noise(noise_pred, args):
+    """Use the same category/history/mutual CFG settings as sampling and inference."""
     noise_pred_allcond, noise_pred_cate_mutual, noise_pred_cate, noise_pred_uncond = noise_pred.chunk(4)
     noise_pred = (
             noise_pred_uncond
-            + hist_guidance_scale * (noise_pred_allcond - noise_pred_cate_mutual)
-            + mutual_guidance_scale * (noise_pred_cate_mutual - noise_pred_cate)
-            + category_guidance_scale * (noise_pred_cate - noise_pred_uncond)
+            + args.hist_guidance_scale * (noise_pred_allcond - noise_pred_cate_mutual)
+            + args.mutual_guidance_scale * (noise_pred_cate_mutual - noise_pred_cate)
+            + args.category_guidance_scale * (noise_pred_cate - noise_pred_uncond)
     )
     return noise_pred
 
 
+def get_num_train_timesteps(latents, requested):
+    """Count complete cached transitions, rather than assuming 50 saved states imply 50 transitions."""
+    if requested < 1:
+        raise ValueError("num_train_timesteps must be positive.")
+    num_transitions = latents["latents"].shape[2]
+    if num_transitions < 1 or latents["next_latents"].shape != latents["latents"].shape:
+        raise ValueError("latents and next_latents must contain matching, non-empty trajectories.")
+    if (latents["timesteps"].shape[2] < num_transitions
+            or latents["scaled_latents"].shape[3] < num_transitions):
+        raise ValueError("Each cached transition needs a timestep and scaled UNet input.")
+    return min(requested, num_transitions)
+
+
+def dpo_loss(log_prob_0, log_prob_1, ref_log_prob_0, ref_log_prob_1, human_prefer, beta, eps):
+    """D3PO's clipped probability-ratio loss, evaluated stably in log space."""
+    if not 0 < eps < 1:
+        raise ValueError("eps must lie strictly between 0 and 1.")
+    # log(clamp(exp(delta), 1-eps, 1+eps)) without overflowing exp(delta).
+    lower, upper = math.log1p(-eps), math.log1p(eps)
+    log_ratio_0 = (log_prob_0.float() - ref_log_prob_0.float()).clamp(lower, upper)
+    log_ratio_1 = (log_prob_1.float() - ref_log_prob_1.float()).clamp(lower, upper)
+    logits = beta * (log_ratio_0 * human_prefer[:, 0] + log_ratio_1 * human_prefer[:, 1])
+    return -F.logsigmoid(logits).mean()
+
+
 def main():
     args = parse_all_args()
+    if args.gradient_accumulation_steps < 1:
+        raise ValueError("gradient_accumulation_steps must be positive.")
 
     if args.non_ema_revision is not None:
         deprecate(
@@ -444,10 +469,8 @@ def main():
 
     accelerator_project_config = ProjectConfiguration(total_limit=args.checkpoints_total_limit, logging_dir=logging_dir)
 
-    num_train_timesteps = int(args.num_steps * 1.0)
-
     accelerator = Accelerator(
-        # gradient_accumulation_steps=args.gradient_accumulation_steps * num_train_timesteps,
+        # The timestep multiplier is set after loading the cached trajectories.
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=args.report_to,
@@ -818,6 +841,7 @@ def main():
     ref = copy.deepcopy(diffusion.unet)
     for param in ref.parameters():
         param.requires_grad = False
+    ref.eval()
     # get sample dict
     samples_before = np.load(args.sample_dir, allow_pickle=True).item()
     latents_before = np.load(args.latent_dir, allow_pickle=True).item()
@@ -874,48 +898,49 @@ def main():
 
     human_prefer = torch.cat(human_prefer, dim=0)
     timesteps = torch.cat(timesteps, dim=0)
-    diffusion.noise_scheduler.timesteps = timesteps[1, :]
     diffusion.noise_scheduler.set_timesteps(args.num_inference_steps, device=accelerator.device)
-    ddim_scheduler.timesteps = timesteps[1, :]
     ddim_scheduler.set_timesteps(args.num_inference_steps, device=accelerator.device)
-    num_timesteps = timesteps.shape[1]
+    num_train_timesteps = get_num_train_timesteps(latents, args.num_train_timesteps)
+    num_saved_transitions = latents["latents"].shape[2]
     total_batch_size = human_prefer.shape[0]
-    combinations_list = list(combinations(range(7), 2))
-
-    test_number = 0
+    combinations_list = list(combinations(range(args.num_per_outfit), 2))
+    pair_batches = []
+    for i in range(0, total_batch_size, args.train_batch_size):
+        feedback = latents["feedback_results"][i:i + args.train_batch_size]
+        for each_combination in combinations_list:
+            if not torch.all(feedback[:, each_combination[0]] == feedback[:, each_combination[1]]):
+                pair_batches.append((i, each_combination))
+    if not pair_batches:
+        raise ValueError("No preference pairs with different feedback labels were found.")
+    logger.info(
+        f"DPO training: {len(pair_batches)} preference batches, "
+        f"{num_train_timesteps}/{num_saved_transitions} saved transitions per pair; "
+        f"CFG category/history/mutual = {args.category_guidance_scale}/"
+        f"{args.hist_guidance_scale}/{args.mutual_guidance_scale}."
+    )
+    optimizer.zero_grad()
 
     for epoch in range(args.num_train_epochs):
-        step = 0
-        # training
         diffusion.unet.train()
         diffusion.to(device)
         ref.to(device)
 
-        save_checkpoint_path = os.path.join(args.output_dir, f"checkpoint-{args.num_per_outfit}-{epoch}")
-        accelerator.save_state(save_checkpoint_path)
+        # Accumulate over all selected timesteps, as in D3PO. Explicit groups
+        # also flush the final incomplete group instead of losing its gradients.
+        for group_start in tqdm(
+                range(0, len(pair_batches), args.gradient_accumulation_steps),
+                desc="Update", position=2, leave=False):
+            group = pair_batches[group_start:group_start + args.gradient_accumulation_steps]
+            accelerator.gradient_accumulation_steps = len(group) * num_train_timesteps
+            # Reset the microstep counter only at a completed optimizer boundary;
+            # the final group can have a smaller accumulation length.
+            accelerator.step = 0
 
-
-        for i in tqdm(range(0, total_batch_size, args.train_batch_size),
-                      desc="Update",
-                      position=2,
-                      leave=False,
-                      ):
-            # if ((i + 1) // args.train_batch_size) % args.checkpointing_steps == 0:
-            #     # save_checkpoint_path = os.path.join(args.output_dir, f"sample-{args.num_per_outfit}-{0}")
-            #     accelerator.save_state(save_checkpoint_path)
-            for each_combination in combinations_list:
-                loss_list = []
+            for i, each_combination in group:
                 sample_0 = tree.map_structure(
                     lambda value: value[i:i + args.train_batch_size, each_combination[0]].to(device), latents)
                 sample_1 = tree.map_structure(
                     lambda value: value[i:i + args.train_batch_size, each_combination[1]].to(device), latents)
-                sample_0["prompt_embeds"] = sample_0["prompt_embeds"].squeeze(0)
-                sample_0["scaled_latents"] = sample_0["scaled_latents"].squeeze(0)
-                sample_1["prompt_embeds"] = sample_1["prompt_embeds"].squeeze(0)
-                sample_1["scaled_latents"] = sample_1["scaled_latents"].squeeze(0)
-
-                if torch.all(sample_0['feedback_results'] == sample_1['feedback_results']):
-                    continue
                 # compute which image is better
                 compare_sample0 = (sample_0['feedback_results'] > sample_1['feedback_results']).int() * 2 - 1
                 compare_sample1 = (sample_1['feedback_results'] > sample_0['feedback_results']).int() * 2 - 1
@@ -924,86 +949,79 @@ def main():
                 compare_sample1[equal_mask] = 0
                 human_prefer = torch.stack([compare_sample0, compare_sample1], dim=1)
 
-                embeds_0 = sample_0["prompt_embeds"]
-                embeds_1 = sample_1["prompt_embeds"]
-                embeds_0.to(device)
-                embeds_1.to(device)
+                # Keep each CFG branch together: [batch, 4, ...] -> [4 * batch, ...].
+                embeds_0 = sample_0["prompt_embeds"].transpose(0, 1).flatten(0, 1)
+                embeds_1 = sample_1["prompt_embeds"].transpose(0, 1).flatten(0, 1)
 
+                # Shuffle transition indices, not individual cache fields, so
+                # x_t, x_{t-1}, timestep and conditional inputs stay aligned.
+                timestep_order = torch.randperm(num_saved_transitions)[:num_train_timesteps].tolist()
                 for j in tqdm(
-                        range(args.num_train_timesteps - 1),
+                        timestep_order,
                         desc="Timestep",
                         position=3,
                         leave=False,
                         disable=not accelerator.is_local_main_process,
                 ):
-                    with accelerator.autocast():
-                        test1 = sample_0["scaled_latents"][:, j]  # Tensor:(4,8,64,64)
-                        test2 = sample_0["timesteps"][:, j]  # Tensor:(1,)
-                        noise_pred_0 = diffusion.unet(
-                            sample_0["scaled_latents"][:, j], sample_0["timesteps"][:, j], embeds_0, return_dict=False
-                        )[0]
-                        noise_pred_0 = pred_noise(noise_pred_0)  # (1,4,64,64)
+                    with accelerator.accumulate(diffusion.unet):
+                        with accelerator.autocast():
+                            inputs_0 = sample_0["scaled_latents"][:, :, j].transpose(0, 1).flatten(0, 1)
+                            inputs_1 = sample_1["scaled_latents"][:, :, j].transpose(0, 1).flatten(0, 1)
+                            noise_pred_0 = diffusion.unet(
+                                inputs_0, sample_0["timesteps"][:, j].repeat(4), embeds_0, return_dict=False
+                            )[0]
+                            noise_pred_0 = pred_noise(noise_pred_0, args)
+                            noise_pred_1 = diffusion.unet(
+                                inputs_1, sample_1["timesteps"][:, j].repeat(4), embeds_1, return_dict=False
+                            )[0]
+                            noise_pred_1 = pred_noise(noise_pred_1, args)
 
-                        noise_pred_1 = diffusion.unet(
-                            sample_1["scaled_latents"][:, j], sample_1["timesteps"][:, j], embeds_1, return_dict=False
-                        )[0]
-                        noise_pred_1 = pred_noise(noise_pred_1)
+                            with torch.no_grad():
+                                noise_ref_pred_0 = ref(
+                                    inputs_0, sample_0["timesteps"][:, j].repeat(4), embeds_0, return_dict=False
+                                )[0]
+                                noise_ref_pred_0 = pred_noise(noise_ref_pred_0, args)
+                                noise_ref_pred_1 = ref(
+                                    inputs_1, sample_1["timesteps"][:, j].repeat(4), embeds_1, return_dict=False
+                                )[0]
+                                noise_ref_pred_1 = pred_noise(noise_ref_pred_1, args)
 
-                        noise_ref_pred_0 = ref(
-                            sample_0["scaled_latents"][:, j], sample_0["timesteps"][:, j], embeds_0, return_dict=False
-                        )[0]
-                        noise_ref_pred_0 = pred_noise(noise_ref_pred_0)
+                            _, total_prob_0 = ddim_step_with_logprob(
+                                ddim_scheduler, noise_pred_0, sample_0["timesteps"][:, j],
+                                sample_0["latents"][:, j], eta=args.eta,
+                                prev_sample=sample_0["next_latents"][:, j],
+                            )
+                            _, total_prob_1 = ddim_step_with_logprob(
+                                ddim_scheduler, noise_pred_1, sample_1["timesteps"][:, j],
+                                sample_1["latents"][:, j], eta=args.eta,
+                                prev_sample=sample_1["next_latents"][:, j],
+                            )
+                            _, total_ref_prob_0 = ddim_step_with_logprob(
+                                ddim_scheduler, noise_ref_pred_0, sample_0["timesteps"][:, j],
+                                sample_0["latents"][:, j], eta=args.eta,
+                                prev_sample=sample_0["next_latents"][:, j],
+                            )
+                            _, total_ref_prob_1 = ddim_step_with_logprob(
+                                ddim_scheduler, noise_ref_pred_1, sample_1["timesteps"][:, j],
+                                sample_1["latents"][:, j], eta=args.eta,
+                                prev_sample=sample_1["next_latents"][:, j],
+                            )
 
-                        noise_ref_pred_1 = ref(
-                            sample_1["scaled_latents"][:, j], sample_1["timesteps"][:, j], embeds_1, return_dict=False
-                        )[0]
-                        noise_ref_pred_1 = pred_noise(noise_ref_pred_1)
-
-                        # compute the log prob of next_latents given latents under the current model
-                        _, total_prob_0 = ddim_step_with_logprob(
-                            ddim_scheduler,
-                            noise_pred_0,
-                            sample_0["timesteps"][:, j],
-                            sample_0["latents"][:, j],
-                            eta=args.eta,
-                            prev_sample=sample_0["next_latents"][:, j],
+                        loss = dpo_loss(
+                            total_prob_0, total_prob_1, total_ref_prob_0, total_ref_prob_1,
+                            human_prefer, args.beta, args.eps,
                         )
-                        _, total_prob_1 = ddim_step_with_logprob(
-                            ddim_scheduler,
-                            noise_pred_1,
-                            sample_1["timesteps"][:, j],
-                            sample_1["latents"][:, j],
-                            eta=args.eta,
-                            prev_sample=sample_1["next_latents"][:, j],
-                        )
-                        _, total_ref_prob_0 = ddim_step_with_logprob(
-                            ddim_scheduler,
-                            noise_ref_pred_0,
-                            sample_0["timesteps"][:, j],
-                            sample_0["latents"][:, j],
-                            eta=args.eta,
-                            prev_sample=sample_0["next_latents"][:, j],
-                        )
-                        _, total_ref_prob_1 = ddim_step_with_logprob(
-                            ddim_scheduler,
-                            noise_ref_pred_1,
-                            sample_1["timesteps"][:, j],
-                            sample_1["latents"][:, j],
-                            eta=args.eta,
-                            prev_sample=sample_1["next_latents"][:, j],
-                        )
-                    # clip the probs of the pre-trained model and this model
-                ratio_0 = torch.clamp(torch.exp(total_prob_0 - total_ref_prob_0), 1 - args.eps, 1 + args.eps)
-                ratio_1 = torch.clamp(torch.exp(total_prob_1 - total_ref_prob_1), 1 - args.eps, 1 + args.eps)
-                loss = -torch.log(torch.sigmoid(args.beta * (torch.log(ratio_0)) * human_prefer[:, 0] + args.beta * (
-                    torch.log(ratio_1)) * human_prefer[:, 1])).mean()
+                        # Accelerator divides by the full accumulation length:
+                        # average per-timestep losses, not trajectory log-probs.
+                        accelerator.backward(loss)
+                        if accelerator.sync_gradients:
+                            accelerator.clip_grad_norm_(trainable_layers.parameters(), args.max_grad_norm)
+                        optimizer.step()
+                        optimizer.zero_grad()
 
-                # backward pass
-                accelerator.backward(loss)
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(trainable_layers.parameters(), args.max_grad_norm)
-                optimizer.step()
-                optimizer.zero_grad()
+        # Save after updates, including the final epoch's trained weights.
+        save_checkpoint_path = os.path.join(args.output_dir, f"checkpoint-{args.num_per_outfit}-{epoch + 1}")
+        accelerator.save_state(save_checkpoint_path)
 
     print(f"Finishing finetuning!")
 
@@ -1198,5 +1216,3 @@ def merge_and_save_images(images, save_path):
 
 if __name__ == "__main__":
     main()
-
-
